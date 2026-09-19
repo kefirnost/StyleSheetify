@@ -1,7 +1,6 @@
 ﻿using System.Text;
 using Content.StyleSheetify.Client.GifImage.Enums;
 using Robust.Client.Graphics;
-using Robust.Shared.IoC;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.PixelFormats;
 
@@ -20,75 +19,85 @@ public sealed class GifDecoder
     public short Height { get; private set; }
     
     public IReadOnlyList<GifFrame> Frames => _frames;
+    public bool IsDecoding { get; private set; }
+    
+    // Опциональное событие, вызываемое при добавлении каждого кадра
+    public event Action<GifFrame>? OnFrameDecoded;
 
     private readonly List<GifFrame> _frames = new();
     private Rgba32[]? _globalColorTable;
-    private Rgba32 _backgroundColor = new(0,0,0);
-    
-    public static GifDecoder Decode(Stream stream, CancellationToken cancellationToken)
+    private Rgba32 _backgroundColor = new(0, 0, 0);
+    private Image<Rgba32> _canvas = null!;
+
+    public void DecodeHeader(Stream stream)
     {
-        var reader = new BinaryReader(stream);
-        if (Encoding.ASCII.GetString(reader.ReadBytes(3)) != "GIF")
-        {
-            reader.Dispose();
+        using var reader = new BinaryReader(stream, Encoding.ASCII, leaveOpen: true);
+        
+        if (new string(reader.ReadChars(3)) != "GIF")
             throw new Exception("Not a valid GIF file.");
-        }
-        
-        var specificationVersion = reader.ReadBytes(3);
-        
-        var decoder = new GifDecoder
-        {
-            Width = reader.ReadInt16(),
-            Height = reader.ReadInt16()
-        };
-        
+
+        reader.ReadBytes(3); // specificationVersion
+
+        Width = reader.ReadInt16();
+        Height = reader.ReadInt16();
+
         var packed = reader.ReadByte();
         var bgColorIndex = reader.ReadByte();
-        var aspectRatio = reader.ReadByte(); 
-        
+        reader.ReadByte(); // aspectRatio
+
         var hasGlobalColorTable = (packed & 0x80) != 0;
         var globalColorTableSize = 1 << ((packed & 0x07) + 1);
-        
+
         if (hasGlobalColorTable)
         {
-            decoder._globalColorTable = ReadColorTable(reader, globalColorTableSize);
-            decoder._backgroundColor = decoder._globalColorTable[bgColorIndex];
+            _globalColorTable = ReadColorTable(reader, globalColorTableSize);
+            _backgroundColor = _globalColorTable[bgColorIndex];
         }
-        
-        decoder._canvas = new Image<Rgba32>(decoder.Width, decoder.Height);
-        
-        for (var y = 0; y < decoder.Height; y++)
-            for (var x = 0; x < decoder.Width; x++) 
-                decoder._canvas[x, y] = decoder._backgroundColor;
-        
+
+        _canvas = new Image<Rgba32>(Width, Height);
+        for (var y = 0; y < Height; y++)
+            for (var x = 0; x < Width; x++) 
+                _canvas[x, y] = _backgroundColor;
+    }
+
+    /// <summary>
+    /// Асинхронная обработка всех кадров GIF. Постепенно добавляет их в _frames.
+    /// </summary>
+    public async Task ProcessFramesAsync(Stream stream, IClyde clyde, CancellationToken cancellationToken)
+    {
+        IsDecoding = true;
+        using var reader = new BinaryReader(stream, Encoding.ASCII, leaveOpen: true);
+
         var delay = 0;
         var disposalMethod = GifDisposalMethod.Unspecified;
         var transIndex = -1;
         var hasTransparency = false;
-        var clyde = IoCManager.Resolve<IClyde>();
 
         try
         {
             var stopGifRead = false;
-
             while (!cancellationToken.IsCancellationRequested && !stopGifRead)
             {
-                switch ((GifBlockIntroducer)reader.ReadByte())
+                var blockType = (GifBlockIntroducer)reader.ReadByte();
+                switch (blockType)
                 {
                     case GifBlockIntroducer.ImageDescriptor:
-                        decoder.DecodeImageFrame(reader, delay, disposalMethod, transIndex,
-                            hasTransparency, clyde);
+                        var frame = await DecodeImageFrameAsync(reader, delay, disposalMethod, transIndex, hasTransparency, clyde, cancellationToken);
+                        _frames.Add(frame);
+                        OnFrameDecoded?.Invoke(frame);
                         break;
+                        
                     case GifBlockIntroducer.Extension:
-                        if ((GifExtensionLabel)reader.ReadByte() == GifExtensionLabel.GraphicControl)
+                        var extLabel = (GifExtensionLabel)reader.ReadByte();
+                        if (extLabel == GifExtensionLabel.GraphicControl)
                         {
-                            var blockSize = reader.ReadByte();
+                            reader.ReadByte(); // blockSize
                             var gcPacked = reader.ReadByte();
 
                             disposalMethod = (GifDisposalMethod)((gcPacked >> 2) & 0x07);
                             hasTransparency = (gcPacked & 0x01) != 0;
 
-                            delay = reader.ReadInt16() * 10; // 1/100th sec to ms
+                            delay = reader.ReadInt16() * 10;
                             transIndex = reader.ReadByte();
 
                             if (reader.ReadByte() != 0x00)
@@ -98,26 +107,25 @@ public sealed class GifDecoder
                         {
                             SkipExtension(reader);
                         }
-
                         break;
+                        
                     case GifBlockIntroducer.Trailer:
                         stopGifRead = true;
                         break;
+                        
                     default:
-                        throw new Exception($"Unknown block introducer");
+                        throw new Exception($"Unknown block introducer: {blockType}");
                 }
             }
         }
         finally
         {
-            reader.Dispose();
+            IsDecoding = false;
         }
-        return decoder;
     }
 
-    private Image<Rgba32> _canvas;
-
-    private void DecodeImageFrame(BinaryReader reader, int delay, GifDisposalMethod disposalMethod, int transIndex, bool hasTransparency, IClyde clyde)
+    private async Task<GifFrame> DecodeImageFrameAsync(
+        BinaryReader reader, int delay, GifDisposalMethod disposalMethod, int transIndex, bool hasTransparency, IClyde clyde, CancellationToken cancellationToken)
     {
         var left = reader.ReadInt16();
         var top = reader.ReadInt16();
@@ -148,8 +156,12 @@ public sealed class GifDecoder
             compressedData.AddRange(reader.ReadBytes(blockSize));
         }
 
-        var indices = LZWHelper.DecompressLZW(compressedData.ToArray(), lzwMinCodeSize, width * height);
+        // Тяжелая CPU-задача уходит в ThreadPool
+        var indices = await Task.Run(() => 
+            LZWHelper.DecompressLZW(compressedData.ToArray(), lzwMinCodeSize, width * height), cancellationToken);
         
+        // После await возвращаемся в главный поток для безопасной работы с IClyde
+
         Image<Rgba32> canvasBefore = null;
         if (disposalMethod == GifDisposalMethod.RestoreToPrevious)
         {
@@ -164,18 +176,18 @@ public sealed class GifDecoder
 
             if (x < Width && y < Height)
             {
-                // If pixel is transparent, don't overwrite the canvas
                 if (hasTransparency && index == transIndex) continue;
-
                 _canvas[x, y] = colorTable[index];
             }
         }
       
-        _frames.Add(new GifFrame
+        var frameTexture = clyde.LoadTextureFromImage(_canvas);
+        
+        var frame = new GifFrame
         {
             DelayMs = delay > 0 ? delay : 100,
-            FrameImage = clyde.LoadTextureFromImage(_canvas)
-        });
+            FrameImage = frameTexture
+        };
         
         if (disposalMethod == GifDisposalMethod.RestoreToBackground)
         {
@@ -188,6 +200,8 @@ public sealed class GifDecoder
             _canvas.Dispose();
             _canvas = canvasBefore;
         }
+
+        return frame;
     }
 
     private static void SkipExtension(BinaryReader reader)
@@ -197,7 +211,6 @@ public sealed class GifDecoder
             var blockSize = reader.ReadByte();
             if (blockSize == 0) break;
             reader.ReadBytes(blockSize);
-            //reader.BaseStream.Position += blockSize;
         }
     }
     
@@ -212,67 +225,6 @@ public sealed class GifDecoder
             table[i] = new Rgba32(r, g, b);
         }
         return table;
-    }
-}
-
-public sealed class SimplePool<T>
-{
-    private readonly T[] _buffer;
-    public int Length { get; private set; }
-    
-    private Queue<int> _free = [];
-    
-    private readonly Func<T> _factory;
-    
-    public SimplePool(int limit, Func<T> factory, bool init = false)
-    {
-        _buffer = new T[limit];
-        _factory = factory;
-
-        if(!init) return;
-        
-        for (var i = 0; i < limit; i++)
-        {
-            _buffer[i] = factory();
-        }
-    }
-    
-    public SimplePoolEntry Take()
-    {
-        if (!_free.TryDequeue(out var index))
-            index = Length++;
-        
-        var objectSelected = _buffer[index];
-        if (objectSelected == null)
-        {
-            objectSelected = _factory();
-            _buffer[index] = objectSelected;
-        }
-        
-        return new SimplePoolEntry(index, objectSelected);
-    }
-
-    public void Free(SimplePoolEntry entry)
-    {
-        _free.Enqueue(entry.Index);
-    }
-
-    public void Clear()
-    {
-        Length = 0;
-        _free.Clear();
-    }
-    
-    public sealed class SimplePoolEntry
-    {
-        public SimplePoolEntry(int index, T value)
-        {
-            Index = index;
-            Value = value;
-        }
-
-        public int Index { get; }
-        public T Value { get; }
     }
 }
 
