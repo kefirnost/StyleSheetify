@@ -65,6 +65,12 @@ public partial class FontSpecifier : Robust.Client.Graphics.Font
         return GetFont().DrawChar(handle, rune, baseline, scale, color, fallback);
     }
 
+    public override float DrawCharOutline(DrawingHandleBase handle, Rune rune, Vector2 baseline, float scale, TextOutline outline,
+        bool fallback = true)
+    {
+        return GetFont().DrawCharOutline(handle, rune, baseline, scale, outline, fallback);
+    }
+
     public override CharMetrics? GetCharMetrics(Rune rune, float scale, bool fallback = true)
     {
         return GetFont().GetCharMetrics(rune, scale, fallback);

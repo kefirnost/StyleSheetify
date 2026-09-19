@@ -1,11 +1,10 @@
 ﻿using Content.StyleSheetify.Shared.Math;
 using Robust.Shared.Maths;
-using Robust.Shared.Serialization;
 using Robust.Shared.Serialization.Manager.Attributes;
 
 namespace Content.StyleSheetify.Client.StyleSheet.StyleBox;
 
-[Serializable, DataDefinition, SerializedType(nameof(StyleBoxRoundData))]
+[Serializable, DataDefinition]
 public sealed partial class StyleBoxRoundData : StyleBoxData
 {
     [DataField] public Color BackgroundColor { get; set; } 
